@@ -27,6 +27,7 @@ final Widget widget = DynamicWidgetParser.parse(
 - [Custom values, colors, and enums](#custom-values-colors-and-enums)
 - [Expressions and variables](#expressions-and-variables)
 - [Actions](#actions)
+- [Calling APIs from actions](#calling-apis-from-actions)
 - [Stateful widgets and keys](#stateful-widgets-and-keys)
 - [Theme integration](#theme-integration)
 - [Security model](#security-model)
@@ -322,6 +323,103 @@ onPressed: action("openProfile", {"userId": $user.id})
 `CallbackResolver`. Referencing an unregistered action fails immediately, with a "did you
 mean?" suggestion, at the point `action(...)` is resolved — never silently, never by falling
 back to any kind of dynamic dispatch.
+
+## Calling APIs from actions
+
+[Actions](#actions) are the only way DSL-rendered UI can trigger app behavior, which raises an
+obvious question for server-driven UI specifically: if every action has to be registered ahead
+of time in Dart, doesn't every new button still need an app update?
+
+Not if you register a handful of **generic, parameterized** actions instead of one per business
+behavior. The action *name* is fixed and shipped once; what it does is described entirely by
+`arguments`, which come from the payload:
+
+```dart
+DynamicWidgetParser.defaultActions.register('callApi', (context, args) async {
+  final String path = args['path'] as String;
+  final Map<String, Object?> body =
+      (args['body'] as Map?)?.cast<String, Object?>() ?? const <String, Object?>{};
+
+  final response = await http.post(
+    Uri.parse('https://api.example.com/$path'),
+    body: jsonEncode(body),
+  );
+  final Map<String, Object?> patch = jsonDecode(response.body) as Map<String, Object?>;
+
+  appDataStore.merge(patch); // see "Feeding the response back" below
+});
+```
+
+```text
+onPressed: action("callApi", {"path": "orders/42/deliver"})
+onPressed: action("callApi", {"path": "orders/42/cancel", "body": {"reason": $reason}})
+```
+
+`callApi`'s Dart implementation never knows what any particular `path` means — it just performs
+the call and hands the response back as data. A "cancel order" button next week is a payload
+change (a new `path`, maybe a new button in the DSL), not a new registered action or a new build.
+
+### Feeding the response back into the UI
+
+`DynamicWidgetParser.parse` is a stateless, repeatable transform (see
+[Stateful widgets and keys](#stateful-widgets-and-keys)), so an action's result has to flow back
+in through `DynamicDataContext` on the *next* build, exactly like any other host data. A small
+shared, listenable store is enough to wire that up once for the whole app:
+
+```dart
+class AppDataStore extends ChangeNotifier {
+  Map<String, Object?> _data = <String, Object?>{};
+  Map<String, Object?> get data => _data;
+
+  void merge(Map<String, Object?> patch) {
+    _data = <String, Object?>{..._data, ...patch};
+    notifyListeners();
+  }
+}
+
+final AppDataStore appDataStore = AppDataStore();
+```
+
+Any screen that listens to it and includes it in `data:` picks up server-pushed updates
+automatically, whichever action call produced them:
+
+```dart
+@override
+void initState() {
+  super.initState();
+  appDataStore.addListener(() => setState(() {}));
+}
+
+@override
+Widget build(BuildContext context) {
+  return DynamicWidgetParser.parse(
+    source: source,
+    context: context,
+    data: DynamicDataContext(values: {
+      'server': appDataStore.data, // whatever the last callApi call returned
+    }),
+  );
+}
+```
+
+```text
+Text($server.callStatus ?? "Tap the phone to reach your courier")
+```
+
+A missing path resolves to `null` (see [Expressions and variables](#expressions-and-variables)),
+so reference server data with `??` and a sensible default rather than assuming it's present —
+it won't be until the first successful call resolves.
+
+### What still needs a real registered action
+
+This pattern covers "call an endpoint, update some data, update some UI" — the overwhelming
+majority of what a server-driven screen needs, and it lets new screens/buttons ship as pure DSL
+changes. It doesn't, and shouldn't, cover a *capability* the app has never exposed before (a
+first Apple Pay integration, a new native SDK, camera access): letting the DSL invoke arbitrary
+platform capabilities by name would reopen exactly the code-execution hole the
+[security model](#security-model) exists to close. That's new attack surface, not new content,
+and belongs behind a real registered action, a code review, and a release — same as it would in
+any app.
 
 ## Stateful widgets and keys
 
